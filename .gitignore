@@ -1,47 +1,17 @@
-# ---- Python ----
+# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.sqlite
-*.db
-
-# ---- Virtual environment ----
+# Venv
 .venv/
 env/
 venv/
-
-# ---- Environment variables ----
+# Secrets
 .env
 .env.*
-
-# ---- Logs & Reports ----
-*.log
-*.out
-*.tmp
-reports/
-*.html
-*.pdf
-
-# ---- Forensic Samples ----
-samples/*.raw
-samples/*.mem
-samples/*.img
-samples/*.dump
-
-# ---- VS Code ----
+# Forensic samples & big artifacts
+samples/
+rag_store/
+# VS Code & OS cruft
 .vscode/
-.history/
-*.code-workspace
-
-# ---- OS Specific ----
-# Windows
-Thumbs.db
-desktop.ini
-$RECYCLE.BIN/
-ehthumbs.db
-
-# macOS
 .DS_Store
-.AppleDouble
-.LSOverride
+Thumbs.db
