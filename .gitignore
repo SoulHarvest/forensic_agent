@@ -1,0 +1,47 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.db
+
+# ---- Virtual environment ----
+.venv/
+env/
+venv/
+
+# ---- Environment variables ----
+.env
+.env.*
+
+# ---- Logs & Reports ----
+*.log
+*.out
+*.tmp
+reports/
+*.html
+*.pdf
+
+# ---- Forensic Samples ----
+samples/*.raw
+samples/*.mem
+samples/*.img
+samples/*.dump
+
+# ---- VS Code ----
+.vscode/
+.history/
+*.code-workspace
+
+# ---- OS Specific ----
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+ehthumbs.db
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
