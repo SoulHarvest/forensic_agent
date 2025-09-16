@@ -11,6 +11,7 @@ venv/
 # Forensic samples & big artifacts
 samples/
 rag_store/
+answers/
 # VS Code & OS cruft
 .vscode/
 .DS_Store
