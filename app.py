@@ -12,6 +12,10 @@ import streamlit as st
 from dotenv import load_dotenv
 import os, subprocess
 from shutil import which
+import hashlib
+from openai import OpenAI
+from dotenv import load_dotenv
+
 
 def vol_path() -> str:
     venv_vol = Path(".venv") / "Scripts" / "vol.exe"
@@ -223,6 +227,69 @@ def _push_history(item: dict):
 
 
 st.divider()
+
+# --- OpenAI client (lazy singleton) ---
+_client = None
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        load_dotenv()
+        _client = OpenAI()
+    return _client
+
+def _df_to_text(df: pd.DataFrame, max_rows: int = 60, max_cols: int = 30, max_chars: int = 8000) -> str:
+    """
+    Convert a DataFrame to a compact CSV-like string for LLM context.
+    Caps rows/cols and truncates to avoid big token bills.
+    """
+    if df is None or df.empty:
+        return ""
+    df2 = df.copy()
+    if len(df2) > max_rows:
+        df2 = df2.head(max_rows)
+    if df2.shape[1] > max_cols:
+        df2 = df2.iloc[:, :max_cols]
+    text = df2.to_csv(index=False)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[truncated]..."
+    return text
+
+# cached function that takes only hashable strings
+@st.cache_data(show_spinner=False)
+def summarize_table_cached(title: str, guidance: str, preview_text: str) -> str:
+    """Cached summary keyed by (title, guidance, preview_text)."""
+    if not preview_text.strip():
+        return "No data to summarize; this may indicate paging, symbol issues, or an unsupported plugin."
+
+    client = _get_client()
+    prompt = (
+        "You are a cautious DFIR analyst. Based ONLY on the table below, "
+        "summarize notable or relevant observations (3–6 concise bullets), even if nothing looks malicious. "
+        "If the data appears clean, describe what that suggests about system stability or normal behavior. "
+        "Then propose 3 concrete next steps an analyst should take. "
+        "Be specific, avoid speculation, and reference table fields plainly.\n\n"
+        f"Context: {title}\n"
+        f"{('Guidance: ' + guidance + '\n') if guidance else ''}"
+        "Table (CSV preview):\n"
+        f"{preview_text}"
+    )
+    try:
+        resp = _get_client().chat.completions.create(
+            model="gpt-5",
+            messages=[
+                {"role": "system", "content": "Be precise, professional, and concise. No code blocks."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"_Summary unavailable: {e}_"
+
+# Small convenience wrapper so tab code stays readable
+def summarize_table(title: str, df: pd.DataFrame, guidance: str = "") -> str:
+    preview = _df_to_text(df)
+    return summarize_table_cached(title=title, guidance=guidance, preview_text=preview)
+
 st.header("Forensics Dashboard")
 
 if not img_path or not Path(img_path).exists():
@@ -230,96 +297,144 @@ if not img_path or not Path(img_path).exists():
 else:
     tabs = st.tabs(["Processes", "Network", "Services", "Injections"])
 
-    # Processes
-    with tabs[0]:
-        try:
-            js = run_vol_json(img_path, "windows.pslist", "--physical")
-            df = rows_to_df(js)
-            st.subheader("Processes")
-            if not df.empty:
-                # Common renames (Vol can vary)
-                df = df.rename(columns={
-                    "PID": "pid", "PPID": "ppid", "ImageFileName": "image",
-                    "CreateTime": "create_time", "ExitTime": "exit_time"
-                })
-                # Quick filters
-                colA, colB = st.columns(2)
-                name_filter = colA.text_input("Filter by process name contains", "")
-                ppid_filter = colB.number_input("Filter by PPID (optional)", min_value=0, value=0, step=1)
-                df_view = df.copy()
-                if name_filter:
-                    df_view = df_view[df_view.astype(str).apply(lambda r: name_filter.lower() in r.str.lower().to_string(), axis=1)]
-                if ppid_filter:
-                    df_view = df_view[df_view.get("ppid", 0) == ppid_filter]
-                st.dataframe(df_view, use_container_width=True, height=360)
-                # Simple chart: top parents by child count
-                if "ppid" in df_view.columns:
-                    st.caption("Top parent processes by child count")
-                    st.bar_chart(df_view["ppid"].value_counts().head(10))
-            else:
-                st.warning("No pslist rows parsed.")
-        except Exception as e:
-            st.error(f"pslist error: {e}")
+# ----------------------------
+# Processes
+# ----------------------------
+with tabs[0]:
+    try:
+        js = run_vol_json(img_path, "windows.pslist", "--physical")
+        df = rows_to_df(js)
+        st.subheader("Processes")
+        if not df.empty:
+            # Common renames
+            df = df.rename(columns={
+                "PID": "pid", "PPID": "ppid", "ImageFileName": "image",
+                "CreateTime": "create_time", "ExitTime": "exit_time"
+            })
+            # Filters
+            colA, colB = st.columns(2)
+            name_filter = colA.text_input("Filter by process name contains", "")
+            ppid_filter = colB.number_input("Filter by PPID (optional)", min_value=0, value=0, step=1)
+            df_view = df.copy()
+            if name_filter:
+                df_view = df_view[df_view.astype(str).apply(
+                    lambda r: name_filter.lower() in r.str.lower().to_string(), axis=1)]
+            if ppid_filter:
+                df_view = df_view[df_view.get("ppid", 0) == ppid_filter]
 
-    # Network
-    with tabs[1]:
-        try:
-            js = run_vol_json(img_path, "windows.netscan")
-            df = rows_to_df(js)
-            st.subheader("Network (netscan)")
-            if not df.empty:
-                df = df.rename(columns={
-                    "LocalAddr": "laddr", "LocalPort": "lport",
-                    "ForeignAddr": "raddr", "ForeignPort": "rport",
-                    "PID": "pid", "Owner": "owner", "Proto": "proto", "State": "state"
-                })
-                colA, colB = st.columns(2)
-                only_listening = colA.checkbox("Only listening", value=False)
-                owner_contains = colB.text_input("Owner contains", "")
-                df_view = df.copy()
-                if only_listening and "state" in df_view.columns:
-                    df_view = df_view[df_view["state"].str.contains("LISTEN", case=False, na=False)]
-                if owner_contains and "owner" in df_view.columns:
-                    df_view = df_view[df_view["owner"].str.contains(owner_contains, case=False, na=False)]
-                st.dataframe(df_view, use_container_width=True, height=360)
-            else:
-                st.warning("No netscan rows parsed.")
-        except Exception as e:
-            st.error(f"netscan error: {e}")
+            st.dataframe(df_view, use_container_width=True, height=360)
 
-    # Services (svcscan)
-    with tabs[2]:
-        try:
-            js = run_vol_json(img_path, "windows.svcscan")
-            df = rows_to_df(js)
-            st.subheader("Services (svcscan)")
-            if not df.empty:
-                st.dataframe(df, use_container_width=True, height=360)
-                if "ServiceName" in df.columns:
-                    st.caption("Top services")
-                    st.bar_chart(df["ServiceName"].value_counts().head(20))
-            else:
-                st.warning("No svcscan rows parsed.")
-        except Exception as e:
-            st.error(f"svcscan error: {e}")
+            # Chart
+            if "ppid" in df_view.columns:
+                st.caption("Top parent processes by child count")
+                st.bar_chart(df_view["ppid"].value_counts().head(10), use_container_width=True)
 
-    # Injections (malfind)
-    with tabs[3]:
-        try:
-            js = run_vol_json(img_path, "windows.malfind")
-            df = rows_to_df(js)
-            st.subheader("Malfind")
-            if not df.empty:
-                # Heuristic flags
-                rx_cols = [c for c in df.columns if "Protection" in c or "protection" in c]
-                if rx_cols:
-                    sus = df[df[rx_cols[0]].str.contains("RX|RWX", na=False)]
-                    st.write(f"Suspected injected regions: {len(sus)}")
-                st.dataframe(df, use_container_width=True, height=360)
-            else:
-                st.info("No malfind hits parsed.")
-        except Exception as e:
-            st.error(f"malfind error: {e}")
+            # GPT Summary
+            if st.button("Generate summary for Processes"):
+                with st.spinner("Summarizing processes..."):
+                    summary = summarize_table(
+                        title="Processes (pslist)",
+                        df=df,
+                        guidance="Summarize normal process activity or any notable anomalies."
+                    )
+                st.info(summary)
+        else:
+            st.warning("No pslist rows parsed.")
+    except Exception as e:
+        st.error(f"pslist error: {e}")
+
+# ----------------------------
+# Network
+# ----------------------------
+with tabs[1]:
+    try:
+        js = run_vol_json(img_path, "windows.netscan")
+        df = rows_to_df(js)
+        st.subheader("Network (netscan)")
+        if not df.empty:
+            df = df.rename(columns={
+                "LocalAddr": "laddr", "LocalPort": "lport",
+                "ForeignAddr": "raddr", "ForeignPort": "rport",
+                "PID": "pid", "Owner": "owner", "Proto": "proto", "State": "state"
+            })
+            colA, colB = st.columns(2)
+            only_listening = colA.checkbox("Only listening", value=False)
+            owner_contains = colB.text_input("Owner contains", "")
+            df_view = df.copy()
+            if only_listening and "state" in df_view.columns:
+                df_view = df_view[df_view["state"].str.contains("LISTEN", case=False, na=False)]
+            if owner_contains and "owner" in df_view.columns:
+                df_view = df_view[df_view["owner"].str.contains(owner_contains, case=False, na=False)]
+
+            st.dataframe(df_view, use_container_width=True, height=360)
+
+            if st.button("Generate summary for Network"):
+                with st.spinner("Summarizing network activity..."):
+                    summary = summarize_table(
+                        title="Network (netscan/netstat)",
+                        df=df_view,
+                        guidance="Highlight unusual listening ports, rare processes using network, suspicious remote IPs, and sockets tied to suspect PIDs."
+                    )
+                st.info(summary)
+        else:
+            st.warning("No netscan rows parsed.")
+    except Exception as e:
+        st.error(f"netscan error: {e}")
+
+# ----------------------------
+# Services
+# ----------------------------
+with tabs[2]:
+    try:
+        js = run_vol_json(img_path, "windows.svcscan")
+        df = rows_to_df(js)
+        st.subheader("Services (svcscan)")
+        if not df.empty:
+            st.dataframe(df, use_container_width=True, height=360)
+            if "ServiceName" in df.columns:
+                st.caption("Top services")
+                st.bar_chart(df["ServiceName"].value_counts().head(20), use_container_width=True)
+
+            if st.button("Generate summary for Services"):
+                with st.spinner("Summarizing services..."):
+                    summary = summarize_table(
+                        title="Services (svcscan/registry)",
+                        df=df,
+                        guidance="Call out non-standard svchost groups, odd service binary paths, disabled/failed services with strange names, and persistence indicators."
+                    )
+                st.info(summary)
+        else:
+            st.warning("No svcscan rows parsed.")
+    except Exception as e:
+        st.error(f"svcscan error: {e}")
+
+# ----------------------------
+# Injections
+# ----------------------------
+with tabs[3]:
+    try:
+        js = run_vol_json(img_path, "windows.malfind")
+        df = rows_to_df(js)
+        st.subheader("Injections (malfind)")
+        if not df.empty:
+            rx_cols = [c for c in df.columns if "Protection" in c or "protection" in c]
+            if rx_cols:
+                sus = df[df[rx_cols[0]].str.contains("RX|RWX", na=False)]
+                st.write(f"Suspected injected regions: {len(sus)}")
+            st.dataframe(df, use_container_width=True, height=360)
+
+            if st.button("Generate summary for Injections"):
+                with st.spinner("Summarizing injection findings..."):
+                    summary = summarize_table(
+                        title="Injections (malfind/dlllist/vadinfo)",
+                        df=df,
+                        guidance="Focus on private RX/RWX regions, PE headers in memory, unsigned or odd DLL paths, and possible process hollowing."
+                    )
+                st.info(summary)
+        else:
+            st.info("No malfind hits parsed.")
+    except Exception as e:
+        st.error(f"malfind error: {e}")
 
 # --- Main: actions ---
 col1, col2 = st.columns(2)
