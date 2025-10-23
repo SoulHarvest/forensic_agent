@@ -2,6 +2,7 @@ import argparse
 import os
 import subprocess
 import textwrap
+import shutil
 from datetime import datetime, timezone
 from hashlib import sha1
 from typing import List
@@ -29,7 +30,7 @@ CHUNK_MAX_LINES = 200              # chunk plugin output into <= this many lines
 CHUNK_MAX_CHARS = 6000             # and never exceed this many characters
 RETRIEVE_TOP_K = 6                 # default number of chunks to retrieve
 VOL_TIMEOUT_SECONDS = 300          # per plugin
-MAX_CONTEXT_CHARS = 16000          # max total chars from retrieved chunks
+MAX_CONTEXT_CHARS = 12000          # max total chars from retrieved chunks
 VOL_RENDERER = "json"  # force Volatility output into JSON (safer encoding)
 
 # Default plugins
@@ -167,9 +168,14 @@ def resolve_plugins(user_list: list[str] | None) -> list[list[str]]:
                 raw.append(argv)
     return raw
 
+def image_to_id(image_path: str) -> str:
+    return sha1(os.path.abspath(image_path).encode("utf-8")).hexdigest()
+
 def run_volatility_and_index(image_path: str, plugins: List[List[str]]):
     coll = get_chroma_collection()
     vol = vol_exe_path()
+
+    image_id = image_to_id(image_path)
 
     for argv in plugins:
         name = " ".join(argv)
@@ -206,12 +212,14 @@ def run_volatility_and_index(image_path: str, plugins: List[List[str]]):
                     "command": " ".join(cmd),
                     "chunk_index": idx,
                     "image_path": image_path,
+                    "image_id": image_to_id(image_path),
                     "created_at_utc": now_utc(),
                 }],
             )
 
-def retrieve_with_chroma(question: str, top_k: int, where: dict | None = None) -> List[dict]:
+def retrieve_with_chroma(question: str, top_k: int, image_id: str | None = None) -> List[dict]:
     coll = get_chroma_collection()
+    where = {"image_id": image_id} if image_id else None
     res = coll.query(query_texts=[question], n_results=top_k, where=where)
 
     docs = []
@@ -265,36 +273,39 @@ def cmd_index(args):
 def cmd_ask(args):
     load_dotenv()
     client = OpenAI()
-    context_docs = retrieve_with_chroma(args.query, args.topk)
+    image_id = image_to_id(args.image) if hasattr(args, "image") and args.image else None
+    context_docs = retrieve_with_chroma(args.query, args.topk, image_id=image_id)
+
     if not context_docs:
         print("[!] No indexed data yet. Run 'index' first.")
         return
+
     messages = build_chat_prompt(args.query, context_docs)
     resp = client.chat.completions.create(model=MODEL_CHAT, messages=messages)
-    answer = (resp.choices[0].message.content or "").strip()
+    ans = (resp.choices[0].message.content or "").strip()   # ✅ define ans here
 
     ensure_dirs("answers/answer.md")
     out_path = args.out or f"answers/answer_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.md"
     header = f"# Answer\n- Model: `{MODEL_CHAT}`\n- Time: {now_utc()}\n\n"
-    srcs = "\n".join([
-    f"- [id: {d['id']}] {summarize_source(d)}"
-    for d in context_docs
-])
+    srcs = "\n".join([f"- [id: {d['id']}] {summarize_source(d)}" for d in context_docs])
     footer = f"\n\n---\n## Sources used\n{srcs}\n"
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(header + answer + footer)
 
-    console.print(Panel.fit(Markdown(answer), title="Answer", border_style="cyan"))
-    console.print(Panel.fit(
-       Markdown("\n".join([f"- {summarize_source(d)}" for d in context_docs]) or "_(no sources)_"),
-        title="Sources used",
-       border_style="magenta"
-   ))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(header + ans + footer)
+
+    # Simplified print output for Streamlit compatibility
+    print("\n ANSWER \n")
+    print(ans)
+    print("\n SOURCES USED \n")
+    for d in context_docs:
+        print(f"- {summarize_source(d)}")
+
     print(f"\n[+] Saved to {out_path}")
 
 def cmd_chat(args):
     load_dotenv()
     client = OpenAI()
+    image_id = image_to_id(args.image) if hasattr(args, "image") and args.image else None
     print("RAG chat. Type your question and press Enter. Type 'exit' to quit.")
     while True:
         try:
@@ -307,13 +318,12 @@ def cmd_chat(args):
         if q.lower() in {"exit", "quit"}:
             print("Bye.")
             return
-        context_docs = retrieve_with_chroma(q, args.topk)
+        context_docs = retrieve_with_chroma(q, args.topk, image_id=image_id)
         if not context_docs:
             print("[!] No indexed data yet. Run 'index' first.")
             continue
         messages = build_chat_prompt(q, context_docs)
         resp = client.chat.completions.create(model=MODEL_CHAT, messages=messages)
-        print("\n" + (resp.choices[0].message.content or "").strip())
         ans = (resp.choices[0].message.content or "").strip()
         console.print(Panel.fit(Markdown(ans), title="Answer", border_style="cyan"))
         console.print(Panel.fit(
@@ -321,6 +331,18 @@ def cmd_chat(args):
             title="Sources used",
             border_style="magenta"
         ))
+
+def cmd_reset(args):
+    confirm = input("⚠️ This will delete ALL indexed data. Continue? (y/n): ").strip().lower()
+    if confirm != "y":
+        print("[!] Reset aborted.")
+        return
+    if os.path.exists(CHROMA_PATH):
+        shutil.rmtree(CHROMA_PATH)
+        print(f"[+] Removed Chroma store at {CHROMA_PATH}")
+    else:
+        print(f"[!] No Chroma store found at {CHROMA_PATH}")
+
 # ======================
 # Main
 # ======================
@@ -339,11 +361,17 @@ def main():
     p_ask.add_argument("-q", "--query", required=True, help="Your question.")
     p_ask.add_argument("--topk", type=int, default=RETRIEVE_TOP_K, help=f"How many chunks to retrieve (default {RETRIEVE_TOP_K})")
     p_ask.add_argument("-o", "--out", default=None, help="Write the answer to this file (default answers/answer_<timestamp>.md)")
+    p_ask.add_argument("-f", "--image", required=False, help="Path to memory image (optional, used to filter by image_id)")
     p_ask.set_defaults(func=cmd_ask)
 
     p_chat = sub.add_parser("chat", help="Interactive chat with retrieval on each turn (Chroma).")
+    p_chat.add_argument("-f", "--image", required=True, help="Path to memory image (e.g., dump.raw)")
     p_chat.add_argument("--topk", type=int, default=RETRIEVE_TOP_K, help=f"How many chunks to retrieve (default {RETRIEVE_TOP_K})")
     p_chat.set_defaults(func=cmd_chat)
+
+    p_reset = sub.add_parser("reset", help="Delete the local Chroma vector store (dangerous).")
+    p_reset.set_defaults(func=cmd_reset)
+
 
 
     args = parser.parse_args()
