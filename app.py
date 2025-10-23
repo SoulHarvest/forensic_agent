@@ -223,7 +223,7 @@ def _push_history(item: dict):
 
 
 st.divider()
-st.header("📊 Forensics Dashboard")
+st.header("Forensics Dashboard")
 
 if not img_path or not Path(img_path).exists():
     st.info("Select or upload a memory image above to enable the dashboard.")

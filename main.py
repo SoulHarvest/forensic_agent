@@ -58,7 +58,6 @@ def get_chroma_collection():
     return coll
 
 def get_openai_embedding_fn():
-    # Uses the same MODEL_EMBED you already set (e.g., "text-embedding-3-small")
     return embedding_functions.OpenAIEmbeddingFunction(
         api_key=os.environ["OPENAI_API_KEY"],
         model_name=MODEL_EMBED
@@ -86,7 +85,7 @@ def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
         text=True,
         encoding="utf-8",      # read as UTF-8
         errors="replace",      # don’t crash on weird glyphs
-        env=env,               # 👈 force UTF-8 inside vol.exe process
+        env=env,               # force UTF-8 inside vol.exe process
     )
     try:
         out, err = proc.communicate(timeout=VOL_TIMEOUT_SECONDS)
